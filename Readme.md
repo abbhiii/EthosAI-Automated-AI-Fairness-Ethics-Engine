@@ -82,6 +82,7 @@ ML models often behave unfairly across gender, race, age, or region—especially
 EthosAI solves a real-life problem: it automatically detects harmful bias, explains why it exists, and provides actionable next steps.
 
 Recruiters love this because it shows:
+
 ✅ You understand ML deeply
 ✅ You can build real full-stack systems
 ✅ You care about ethical & responsible AI
