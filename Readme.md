@@ -49,32 +49,6 @@ This project demonstrates:
 
 ---
 
-## 📁 Project Structure
-EthosAI/
-├── Backend/ # FastAPI + ML fairness engine
-│ ├── app/
-│ │ └── main.py
-│ ├── train_and_predict.py
-│ ├── train_with_reweighing.py
-│ ├── explain_permutation.py
-│ ├── llm_report.py
-│ ├── predicted_adult.csv (demo)
-│ └── requirements.txt
-│
-├── Frontend/ # Next.js fairness dashboard
-│ ├── app/
-│ ├── public/
-│ ├── package.json
-│ ├── tsconfig.json
-│ ├── next.config.ts
-│ ├── eslint.config.mjs
-│ └── postcss.config.mjs
-│
-└── README.md
-
-
----
-
 ## ✅ **Backend Setup (FastAPI)**
 
 ```bash
@@ -93,7 +67,7 @@ Health check:
 curl http://127.0.0.1:8000/health
 ```
 
-✅ Frontend Setup (Next.js + Tailwind)
+## ✅ Frontend Setup (Next.js + Tailwind)
 cd Frontend
 npm install
 npm run dev
@@ -102,7 +76,7 @@ npm run dev
 Frontend runs at:
 👉 http://localhost:3000
 
-🌟 Why This Project Matters
+## 🌟 Why This Project Matters
 
 ML models often behave unfairly across gender, race, age, or region—especially in hiring, finance, and insurance.
 EthosAI solves a real-life problem: it automatically detects harmful bias, explains why it exists, and provides actionable next steps.
