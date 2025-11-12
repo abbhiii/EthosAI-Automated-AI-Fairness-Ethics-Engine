@@ -1,26 +1,67 @@
+# backend/app/main.py
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
 import io
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 from sklearn.metrics import confusion_matrix
 import uvicorn
 import os
 import sys
 import subprocess
 import numpy as np
+import logging
 
-app = FastAPI(title="EthosAI - Fairness & Report API", version="0.2.2")
+# =========================
+# Basic config & logging
+# =========================
+APP_NAME = "EthosAI - Fairness & Report API"
+APP_VERSION = "0.3.0"
+MAX_FILE_BYTES = 20 * 1024 * 1024  # 20MB guardrail
 
-# CORS for Next.js dev
+# Allow overriding CORS via env (handy for AWS/GCP later)
+FRONTEND_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("ethosai")
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
+    allow_origins=[o.strip() for o in FRONTEND_ORIGINS if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =========================
+# Helpers
+# =========================
+def _ensure_csv_bytes(file: UploadFile) -> bytes:
+    if not file.filename.lower().endswith((".csv", ".txt")):
+        raise HTTPException(status_code=400, detail="Please upload a CSV (.csv or .txt)")
+
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_FILE_BYTES//(1024*1024)}MB)")
+    return data
+
+def _read_csv(bytes_data: bytes) -> pd.DataFrame:
+    try:
+        return pd.read_csv(io.BytesIO(bytes_data))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error parsing CSV: {e}")
 
 def map_income_to01(series: pd.Series) -> pd.Series:
     """
@@ -36,8 +77,22 @@ def map_income_to01(series: pd.Series) -> pd.Series:
 def to01_generic(series: pd.Series) -> pd.Series:
     """Fallback mapper for arbitrary binary targets, using common positives."""
     s = series.astype(str).str.strip().str.lower().str.replace('"', '', regex=False)
-    positives = { "1","true","yes","y","positive",">50k",">50k.","income>50k","gt50k","gt50k." }
+    positives = {"1","true","yes","y","positive",">50k",">50k.","income>50k","gt50k","gt50k."}
     return s.apply(lambda x: 1 if (x in positives or '>50k' in x) else 0).astype(int)
+
+def _maybe_numeric_threshold(df: pd.DataFrame, col: str, y_num: pd.Series) -> Tuple[pd.Series, Optional[float]]:
+    """
+    If mapping produced all zeros or all ones and target appears continuous,
+    fallback to median threshold.
+    """
+    threshold_used = None
+    if (y_num.sum() == 0 or y_num.sum() == len(y_num)):
+        coerced = pd.to_numeric(df[col], errors='coerce')
+        if coerced.notnull().sum() > 0 and coerced.nunique() > 2:
+            thresh = float(coerced.median())
+            y_num = (coerced > thresh).fillna(0).astype(int)
+            threshold_used = thresh
+    return y_num, threshold_used
 
 def compute_basic_fairness(df: pd.DataFrame, target_col: str, sensitive_col: str):
     """
@@ -53,15 +108,14 @@ def compute_basic_fairness(df: pd.DataFrame, target_col: str, sensitive_col: str
 
     df = df.copy()
 
-    # Force robust string mapping for labels first; if that fails, use generic mapper.
+    # Try robust income mapping first, then generic, then numeric threshold
     y_str = df[target_col].astype(str)
     y_num = map_income_to01(y_str)
-    if y_num.sum() == 0 and y_num.mean() == 0:
-        # If mapping produced all zeros, fall back to generic
+    if y_num.sum() == 0 and (y_num == 0).all():
         y_num = to01_generic(y_str)
+    y_num, threshold_used = _maybe_numeric_threshold(df, target_col, y_num)
 
     df["_target_bin"] = y_num
-
     groups = df[sensitive_col].astype(str).unique().tolist()
 
     report = {
@@ -73,7 +127,7 @@ def compute_basic_fairness(df: pd.DataFrame, target_col: str, sensitive_col: str
         "by_group": {}
     }
 
-    for g in groups:
+    for g in sorted(groups):
         sub = df[df[sensitive_col].astype(str) == g]
         if len(sub) == 0:
             continue
@@ -85,7 +139,110 @@ def compute_basic_fairness(df: pd.DataFrame, target_col: str, sensitive_col: str
             "fpr": None
         }
 
-    return report
+    debug = {"threshold_used": threshold_used}
+    return report, debug
+
+def _suggest_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """
+    Heuristically suggest:
+      - targets: likely label columns (binary / names like 'label', 'target', 'income', 'y')
+      - protected: columns like 'sex', 'gender', 'race', 'age', 'marital-status', etc. (categorical, few unique)
+    """
+    cols = list(df.columns)
+    lower = {c: c.lower() for c in cols}
+
+    likely_targets = []
+    for c in cols:
+        lc = lower[c]
+        if any(k in lc for k in ["target", "label", "y", "income", "clicked", "churn"]):
+            likely_targets.append(c)
+
+    # also include binary columns by unique count
+    for c in cols:
+        try:
+            nunq = df[c].nunique(dropna=True)
+            if nunq == 2 and c not in likely_targets:
+                likely_targets.append(c)
+        except Exception:
+            pass
+
+    likely_protected = []
+    protected_keywords = [
+        "sex","gender","race","ethnicity","age","nationality","marital","religion","skin","disability","caste"
+    ]
+    for c in cols:
+        lc = lower[c]
+        if any(k in lc for k in protected_keywords):
+            likely_protected.append(c)
+
+    # also include low-cardinality categoricals (e.g., <= 10 unique)
+    for c in cols:
+        try:
+            nunq = df[c].nunique(dropna=True)
+            if nunq > 1 and nunq <= 10 and c not in likely_protected:
+                likely_protected.append(c)
+        except Exception:
+            pass
+
+    # keep order stable & unique
+    def _uniq(seq):
+        seen = set(); out = []
+        for x in seq:
+            if x not in seen:
+                out.append(x); seen.add(x)
+        return out
+
+    return _uniq(likely_targets)[:10], _uniq(likely_protected)[:10]
+
+# =========================
+# Schemas (for clarity)
+# =========================
+class AnalyzeResponse(BaseModel):
+    status: str
+    analysis: Dict[str, Any]
+
+# =========================
+# Routes
+# =========================
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return f"{APP_NAME} v{APP_VERSION}"
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/api/analyze-dataset", response_model=AnalyzeResponse)
+async def analyze_dataset(file: UploadFile = File(...)):
+    """
+    Quick column analysis for UI:
+      - returns column names + dtypes + unique counts
+      - suggests likely target & protected columns
+    """
+    data = _ensure_csv_bytes(file)
+    df = _read_csv(data)
+
+    cols_info = {}
+    for c in df.columns:
+        try:
+            cols_info[c] = {
+                "dtype": str(df[c].dtype),
+                "nunique": int(df[c].nunique(dropna=True)),
+                "example": None if df[c].dropna().empty else str(df[c].dropna().iloc[0])[:120],
+            }
+        except Exception:
+            cols_info[c] = {"dtype": "unknown", "nunique": -1, "example": None}
+
+    suggested_targets, suggested_protected = _suggest_columns(df)
+
+    return {
+        "status": "ok",
+        "analysis": {
+            "columns": cols_info,
+            "suggested_targets": suggested_targets,
+            "suggested_protected": suggested_protected,
+        }
+    }
 
 @app.post("/api/upload-dataset")
 async def upload_dataset(
@@ -103,18 +260,12 @@ async def upload_dataset(
     - sensitive_col: sensitive attribute column (e.g., sex, race)
     - predictions_col (optional): if provided, computes TPR/FPR per group.
     """
-    if not dataset.filename.lower().endswith((".csv", ".txt")):
-        raise HTTPException(status_code=400, detail="Please upload a CSV file")
-
-    contents = await dataset.read()
-    try:
-        df = pd.read_csv(io.BytesIO(contents))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error parsing CSV: {e}")
+    data = _ensure_csv_bytes(dataset)
+    df = _read_csv(data)
 
     # Base report with robust mapping
     try:
-        report = compute_basic_fairness(df, target_col, sensitive_col)
+        report, mapping_debug = compute_basic_fairness(df, target_col, sensitive_col)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -155,12 +306,16 @@ async def upload_dataset(
             report["by_group"][g]["tpr"] = tpr
             report["by_group"][g]["fpr"] = fpr
 
-    # Debug info to verify mapping
+    # Debug info to verify mapping (and show a few unique raw labels)
     _s = df[target_col].astype(str).str.lower().str.replace('"','', regex=False).str.replace(' ','', regex=False)
     _pos = int(_s.str.contains('>50k', regex=False).sum())
     _neg = int(_s.str.contains('<=50k', regex=False).sum())
     _uniq = _s.unique().tolist()[:6]
-    return JSONResponse(content={"status": "ok", "report": report, "debug": {"unique": _uniq, "pos": _pos, "neg": _neg}})
+    debug = {"unique": _uniq, "pos": _pos, "neg": _neg}
+    if isinstance(mapping_debug, dict):
+        debug.update(mapping_debug)
+
+    return JSONResponse(content={"status": "ok", "report": report, "debug": debug})
 
 @app.post("/api/generate-report")
 def generate_report():
@@ -168,8 +323,7 @@ def generate_report():
     Run llm_report.py (recomputes metrics on YOUR local dataset at ../data/adult.csv)
     and return the report text as JSON.
     """
-    # app/ -> backend/
-    BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+    BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # backend/
     script_path = os.path.join(BASE_DIR, "llm_report.py")
     report_path = os.path.join(BASE_DIR, "ethos_ai_report.txt")
 
@@ -195,9 +349,5 @@ def generate_report():
 
     return {"status": "ok", "report": text}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), reload=True)
