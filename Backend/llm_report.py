@@ -28,7 +28,9 @@ def per_group_metrics_from_arrays(y_true, y_pred, groups_mask, group_names):
 def compute_models_and_metrics():
     # load data & preprocess (uses same logic as train scripts)
     base = os.path.dirname(__file__)
-    data_path = os.path.join(base, "../data/adult.csv")
+    # data_path = os.path.join(base, "../data/adult.csv")
+    data_path = os.path.join(os.path.dirname(__file__), "data/adult.csv")
+
     df = load_and_clean(data_path)
     X, y, feature_names = preprocess(df)
     X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
